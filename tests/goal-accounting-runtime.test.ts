@@ -99,12 +99,16 @@ function makeRuntime(overrides: Partial<{
 	isActionable: (id: string | null | undefined) => boolean;
 	getGoal: () => GoalRecord | null;
 	sent: Array<{ content: string; details: Record<string, unknown> }>;
+	continuationIdleDelayMs: (ctx: ExtensionContext) => number | undefined;
+	liveBackgroundRuns: () => number;
 }> = {}) {
 	const sent: Array<{ content: string; details: Record<string, unknown> }> = [];
 	const runtime = new GoalRuntime({
 		sendFollowUp: (content, details) => { sent.push({ content, details }); },
 		getGoal: () => overrides.getGoal?.() ?? null,
 		isActionable: (id) => overrides.isActionable ? overrides.isActionable(id) : false,
+		continuationIdleDelayMs: overrides.continuationIdleDelayMs,
+		liveBackgroundRuns: overrides.liveBackgroundRuns,
 	});
 	return { runtime, sent };
 }
@@ -129,6 +133,92 @@ describe("GoalRuntime continuation scheduling", () => {
 		// Timers are unref'd; fire the scheduled continuation deterministically.
 		runtime.clearContinuationState();
 		assert.equal(runtime.continuationPendingFor(goal.id), false);
+	});
+
+	// ── Fork patches 1 + 2: continuation cooldown + background-run wake ──────
+
+	const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+	it("fork patch 1: hygiene-only turns wait out the continuation cooldown", async () => {
+		const goal = activeGoal();
+		const { runtime, sent } = makeRuntime({
+			isActionable: () => true,
+			getGoal: () => goal,
+			continuationIdleDelayMs: () => 300_000,
+			liveBackgroundRuns: () => 0,
+		});
+		runtime.queueContinuation(mockCtx(), goal, false, { turnKind: "hygiene", backgroundWait: true });
+		assert.equal(runtime.continuationPendingFor(goal.id), true, "the cooldown keeps the continuation scheduled");
+		await sleep(30);
+		assert.equal(sent.length, 0, "the checkpoint must not fire before the cooldown elapses");
+		runtime.clearContinuationState();
+	});
+
+	it("fork patch 1: objective-work turns keep the immediate wake", async () => {
+		const goal = activeGoal();
+		const { runtime, sent } = makeRuntime({
+			isActionable: () => true,
+			getGoal: () => goal,
+			continuationIdleDelayMs: () => 300_000,
+			liveBackgroundRuns: () => 0,
+		});
+		runtime.queueContinuation(mockCtx(), goal, false, { turnKind: "productive", backgroundWait: true });
+		await sleep(30);
+		assert.equal(sent.length, 1, "write/edit/bash turns keep the upstream cadence");
+	});
+
+	it("fork patch 1: a 0 cooldown restores the upstream immediate wake (legacy override)", async () => {
+		const goal = activeGoal();
+		const { runtime, sent } = makeRuntime({
+			isActionable: () => true,
+			getGoal: () => goal,
+			continuationIdleDelayMs: () => 0,
+			liveBackgroundRuns: () => 0,
+		});
+		runtime.queueContinuation(mockCtx(), goal, false, { turnKind: "hygiene", backgroundWait: true });
+		await sleep(30);
+		assert.equal(sent.length, 1, "PI_GOAL_CONTINUATION_IDLE_DELAY_MS=0 must preserve upstream behavior");
+	});
+
+	it("fork patch 2: a live background run holds even objective-work turns (completion event is the wake)", async () => {
+		const goal = activeGoal();
+		const { runtime, sent } = makeRuntime({
+			isActionable: () => true,
+			getGoal: () => goal,
+			continuationIdleDelayMs: () => 300_000,
+			liveBackgroundRuns: () => 1,
+		});
+		runtime.queueContinuation(mockCtx(), goal, false, { turnKind: "productive", backgroundWait: true });
+		await sleep(30);
+		assert.equal(sent.length, 0, "the completion event wakes early; the idle delay is the deadline");
+		runtime.clearContinuationState();
+	});
+
+	it("fork patch 2: without backgroundWait, resume paths stay immediate even with live runs", async () => {
+		const goal = activeGoal();
+		const { runtime, sent } = makeRuntime({
+			isActionable: () => true,
+			getGoal: () => goal,
+			continuationIdleDelayMs: () => 300_000,
+			liveBackgroundRuns: () => 3,
+		});
+		// force + no options = session_start/compaction/goal-creation path.
+		runtime.queueContinuation(mockCtx(), goal, true);
+		await sleep(30);
+		assert.equal(sent.length, 1, "user-initiated resumes are never background-gated");
+	});
+
+	it("fork: zero-tool settle path keeps upstream semantics when no background run is live", async () => {
+		const goal = activeGoal();
+		const { runtime, sent } = makeRuntime({
+			isActionable: () => true,
+			getGoal: () => goal,
+			continuationIdleDelayMs: () => 300_000,
+			liveBackgroundRuns: () => 0,
+		});
+		runtime.queueContinuation(mockCtx(), goal, true, { backgroundWait: true });
+		await sleep(30);
+		assert.equal(sent.length, 1, "no-tool runs keep upstream behavior (upstream #53/#54 own that class)");
 	});
 });
 

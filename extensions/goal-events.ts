@@ -10,6 +10,7 @@ import {
 	isAbortedAssistantMessage,
 	isErrorAssistantMessage,
 	isMeaningfulProgressToolCall,
+	isMutationProgressToolCall,
 	isToolUseAssistantMessage,
 } from "./goal-format.ts";
 import { buildCompactionSummary, buildPostCompactionGoalDelta } from "./goal-compaction.ts";
@@ -97,6 +98,7 @@ export function registerGoalEvents(core: GoalCore): void {
 		// Per-turn flag resets (#4 + C9 fix).
 		core.advanceTurnSeq();
 		core.goalWorkToolCalledThisTurn = false;
+		core.goalMutationToolCalledThisTurn = false;
 		core.beginAccounting();
 		core.goalService.beginTurn(ctx, core.focusedGoalId); // P1-3 transaction buffer
 		core.touchGoalActivity(); // F5
@@ -131,6 +133,9 @@ export function registerGoalEvents(core: GoalCore): void {
 		// Track for #4 empty-turn gate.
 		if (isMeaningfulProgressToolCall(event.toolName, asRecord(event)?.args)) {
 			core.goalWorkToolCalledThisTurn = true;
+			// Fork patch 1: classify the turn for the continuation cooldown —
+			// read-only host tools and goal-record bookkeeping do not reset it.
+			if (isMutationProgressToolCall(event.toolName, asRecord(event)?.args)) core.goalMutationToolCalledThisTurn = true;
 			// Issue #26: record a meaningful work attempt against armed Oracle
 			// advice. get_goal / echo-only reads are excluded upstream by
 			// isMeaningfulProgressToolCall.
@@ -255,7 +260,13 @@ export function registerGoalEvents(core: GoalCore): void {
 			&& core.state.goal.autoContinue
 			&& core.goalWorkToolCalledThisTurn
 		) {
-			core.queueContinuation(ctx);
+			// Fork patches 1 + 2: a hygiene-only turn (or any turn while a
+			// background run is live) waits out the continuation cooldown instead
+			// of waking immediately.
+			core.queueContinuation(ctx, false, {
+				turnKind: core.goalMutationToolCalledThisTurn ? "productive" : "hygiene",
+				backgroundWait: true,
+			});
 		}
 		core.goalService.endTurn(ctx); // P1-3: single flush (lock + write + ledger batch)
 	});
@@ -272,6 +283,10 @@ export function registerGoalEvents(core: GoalCore): void {
 
 	pi.on("session_start", async (event, ctx) => {
 		core.auditMessages.clear();
+		// Fork patch 2: background-run wake events carry the originating run's
+		// session; scope the registry so another session's runs cannot hold
+		// this session's continuation.
+		core.setBackgroundWakeSessionId(ctx.sessionManager?.getSessionId?.() ?? null);
 		// NAF: the zero-op read caches are session-scoped — a new session always
 		// re-reads settings/pool/ledger fresh from disk (cross-process and
 		// hand-edited changes are picked up at the session boundary).
@@ -539,7 +554,18 @@ export function registerGoalEvents(core: GoalCore): void {
 		const networkErrorGoalId = networkErrorRecoveryAfterSettleFor;
 		networkErrorRecoveryAfterSettleFor = null;
 		if (goalId && core.isActionableContinuationGoal(goalId)) {
-			core.queueContinuation(ctx, true);
+			// Fork patches 1 + 2: agent_settled re-queues bypass the dedup but
+			// still honor the cooldown classification (see turn_end above). A run
+			// that touched no work tool keeps the upstream zero-tool semantics
+			// (upstream #53/#54 own that case) but still waits while background
+			// runs are live.
+			const turnKind = core.goalWorkToolCalledThisTurn
+				? (core.goalMutationToolCalledThisTurn ? "productive" : "hygiene")
+				: undefined;
+			core.queueContinuation(ctx, true, {
+				...(turnKind ? { turnKind } : {}),
+				backgroundWait: true,
+			});
 			return;
 		}
 		if (!networkErrorGoalId || !core.isActionableContinuationGoal(networkErrorGoalId)) return;

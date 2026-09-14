@@ -394,6 +394,7 @@ export function registerGoalCommands(core: GoalCore): void {
 		{ key: "disableContracts", label: "disableContracts", section: "Goal behavior", kind: "boolean" },
 		{ key: "stallTimeoutMinutes", label: "stall timeout (minutes)", section: "Goal behavior", kind: "positiveInteger" },
 		{ key: "objectiveMaxChars", label: "max objective length (0 = none)", section: "Goal behavior", kind: "positiveInteger" },
+		{ key: "continuationIdleDelayMs", label: "continuation idle delay (ms, 0 = legacy)", section: "Goal behavior", kind: "positiveInteger" },
 		{ key: "disableTasks", label: "disableTasks", section: "Task tracking", kind: "boolean" },
 		{ key: "subtaskDepth", label: "subtaskDepth", section: "Task tracking", kind: "positiveInteger" },
 		{ key: "disabled", label: "auditor disabled", section: "Completion auditor", kind: "boolean" },
@@ -416,6 +417,7 @@ export function registerGoalCommands(core: GoalCore): void {
 		if (key === "subtaskDepth") return config.subtaskDepth !== undefined ? String(config.subtaskDepth) : "1";
 		if (key === "stallTimeoutMinutes") return config.stallTimeoutMinutes !== undefined ? String(config.stallTimeoutMinutes) : "0";
 		if (key === "objectiveMaxChars") return config.objectiveMaxChars !== undefined ? String(config.objectiveMaxChars) : "0";
+		if (key === "continuationIdleDelayMs") return config.continuationIdleDelayMs !== undefined ? String(config.continuationIdleDelayMs) : "0";
 		if (key === "keybindings") return config.keybindings ? `${config.keybindings.dashboard.toggleExpand}, ${config.keybindings.dashboard.scrollUp}, ${config.keybindings.dashboard.scrollDown}` : "(default)";
 		const value = (config as Record<string, unknown>)[key];
 		return typeof value === "string" ? value : "(default)";
@@ -564,7 +566,7 @@ export function registerGoalCommands(core: GoalCore): void {
 				}
 
 				if (row.kind === "positiveInteger") {
-					const min = row.path ? 1 : ((row.key === "stallTimeoutMinutes" || row.key === "objectiveMaxChars") ? 0 : 1);
+					const min = row.path ? 1 : ((row.key === "stallTimeoutMinutes" || row.key === "objectiveMaxChars" || row.key === "continuationIdleDelayMs") ? 0 : 1);
 					const actions = [`Set ${scope} override...`];
 					if (hasLocalOverride) actions.push(inheritLabel);
 					actions.push("Cancel");

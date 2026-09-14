@@ -67,6 +67,27 @@ export const GOAL_PROGRESS_TOOL_NAMES = [
 	"ls",
 ] as const;
 
+/**
+ * Tools whose call constitutes objective work — the "productive" class that
+ * keeps the upstream round-trip continuation cadence (`write`, `edit`, `bash`).
+ *
+ * Everything else a checkpoint turn touches is bookkeeping/hygiene and does
+ * NOT reset the fork's continuation cooldown: read-only host tools (`read`,
+ * `grep`, `find`, `ls`) and goal-record tools (`update_goal`,
+ * `set_goal_tasks`, `update_goal_task`) — the audit's "routine goal hygiene"
+ * loop (bootstrap docs/audits/2026-09-14-harness-support-audit.md §A).
+ *
+ * `bash` is classified as productive on purpose: a shell command may change
+ * state and cannot be classified syntactically, so bash-driven turns keep the
+ * upstream cadence (the conservative choice). Refining read-only shell
+ * detection is a deliberate follow-up.
+ */
+export const GOAL_MUTATION_TOOL_NAMES = [
+	"write",
+	"edit",
+	"bash",
+] as const;
+
 /** Tools the model may still call on a stopped turn (state reads only). */
 export const POST_STOP_ALLOWED_TOOLS = ["get_goal"] as const;
 

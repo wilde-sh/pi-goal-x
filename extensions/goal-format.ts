@@ -9,7 +9,7 @@ import {
 import { buildTaskSummary } from "./goal-policy.ts";
 import { countTaskSubtree } from "./goal-task-count.ts";
 import { latestAuditorResultForGoal, latestEventsForGoal, type GoalLedgerEvent } from "./goal-ledger.ts";
-import { GOAL_PROGRESS_TOOL_NAMES } from "./goal-tool-names.ts";
+import { GOAL_MUTATION_TOOL_NAMES, GOAL_PROGRESS_TOOL_NAMES } from "./goal-tool-names.ts";
 import {
 	asRecord,
 	cloneGoal,
@@ -33,6 +33,8 @@ export const COMPLETE_STATUS = "complete";
  * autoContinue — the agent was just chatting. This stops infinite chat loops.
  */
 export const GOAL_PROGRESS_TOOL_SET = new Set<string>(GOAL_PROGRESS_TOOL_NAMES);
+/** Mutation-class progress tools (fork): productive turns that keep the upstream cadence. */
+export const GOAL_MUTATION_TOOL_SET = new Set<string>(GOAL_MUTATION_TOOL_NAMES);
 
 // ---------- summaries ----------
 
@@ -318,6 +320,17 @@ export function isMeaningfulProgressToolCall(toolName: string, args: unknown): b
 		if (typeof command === "string" && /^\s*echo\b/.test(command)) return false;
 	}
 	return true;
+}
+
+/**
+ * Fork patch 1: whether a meaningful progress tool call was objective work
+ * (`write`, `edit`, `bash`). Read-only host tools and goal-record bookkeeping
+ * are hygiene; they still count for `isMeaningfulProgressToolCall` (the
+ * empty-turn gate) but do not reset the continuation cooldown.
+ */
+export function isMutationProgressToolCall(toolName: string, args: unknown): boolean {
+	if (!isMeaningfulProgressToolCall(toolName, args)) return false;
+	return GOAL_MUTATION_TOOL_SET.has(toolName);
 }
 
 /**

@@ -41,6 +41,20 @@ function createHarness(cwd: string) {
 	const handlers: HandlerMap = {};
 	const sentMessages: Array<{ customType?: string; details?: unknown }> = [];
 	const notifications: Array<{ message: string; level?: string }> = [];
+	// Fork patch 2: in-process event bus double so tests can emit producer
+	// lifecycle events (pi-subagents / pi-dynamic-workflows channels).
+	const busHandlers = new Map<string, Set<(data: unknown) => void>>();
+	const events = {
+		on: (channel: string, handler: (data: unknown) => void) => {
+			const set = busHandlers.get(channel) ?? new Set<(data: unknown) => void>();
+			set.add(handler);
+			busHandlers.set(channel, set);
+			return () => { set.delete(handler); };
+		},
+		emit: (channel: string, data: unknown) => {
+			for (const handler of busHandlers.get(channel) ?? []) handler(data);
+		},
+	};
 	let aborts = 0;
 	let toolCalls = 0;
 
@@ -59,6 +73,7 @@ function createHarness(cwd: string) {
 		getActiveTools: () => ["read", "bash", "edit", "write"],
 		setActiveTools: () => {},
 		hasUI: false,
+		events,
 	};
 
 	const ctx = {
@@ -88,6 +103,7 @@ function createHarness(cwd: string) {
 		handlers,
 		sentMessages,
 		notifications,
+		events,
 		get aborts() { return aborts; },
 		get toolCalls() { return toolCalls; },
 		ctx,
@@ -364,6 +380,136 @@ test("successful agent_end waits for agent_settled before queuing a continuation
 
 		await h.handlers["agent_settled"]!({}, idleCtx(h.ctx));
 		assert.equal(await countCheckpoints(h), 1, "agent_settled queues the continuation without idle polling");
+	} finally {
+		// temp dir cleanup is best-effort.
+	}
+});
+
+// ── Fork: continuation cooldown + background-run wake (patches 1 + 2) ────────
+// The two patches intentionally diverge from upstream 0.31.2: a turn whose
+// progress calls were all read-only/goal-bookkeeping ("hygiene") no longer
+// wakes immediately, and any turn waits while a background workflow/subagent
+// run is live (the run's completion event is the wake, the idle delay is the
+// deadline). Objective work (write/edit/bash) keeps the upstream cadence.
+
+async function userTurn(h: ReturnType<typeof createHarness>): Promise<void> {
+	await h.handlers["before_agent_start"]!({
+		systemPrompt: "base",
+		prompt: "user typed: continue",
+		systemPromptOptions: {},
+	}, h.ctx);
+}
+
+async function settleTurn(h: ReturnType<typeof createHarness>, toolName?: string, args: Record<string, unknown> = {}): Promise<void> {
+	await h.handlers["turn_start"]!({}, h.ctx);
+	if (toolName) {
+		await h.handlers["tool_call"]!({ toolName, args }, h.ctx);
+		await h.handlers["tool_execution_end"]!({}, h.ctx);
+	}
+	const message = { role: "assistant", content: [{ type: "text", text: "done" }] };
+	await h.handlers["turn_end"]!({ message }, idleCtx(h.ctx));
+	await h.handlers["agent_end"]!({ messages: [message] }, idleCtx(h.ctx));
+	await h.handlers["agent_settled"]!({}, idleCtx(h.ctx));
+}
+
+test("fork patch 1: hygiene-only turns wait out the continuation cooldown (turn_end + agent_settled)", async () => {
+	const { cwd, goal } = fixtureCwd();
+	const h = createHarness(cwd);
+	try {
+		await startSession(h.handlers, h.ctx, sessionEntriesFor(goal));
+		await userTurn(h);
+
+		// A read-only work turn is the audit's waste class: it must not re-arm an
+		// immediate checkpoint at either re-queue gate.
+		await settleTurn(h, "read", { path: "README.md" });
+		assert.equal(await countCheckpoints(h), 0, "read-only turn waits out the cooldown instead of waking immediately");
+	} finally {
+		// temp dir cleanup is best-effort.
+	}
+});
+
+test("fork patch 1: goal-bookkeeping calls are hygiene too (update_goal_task)", async () => {
+	const { cwd, goal } = fixtureCwd();
+	const h = createHarness(cwd);
+	try {
+		await startSession(h.handlers, h.ctx, sessionEntriesFor(goal));
+		await userTurn(h);
+
+		await settleTurn(h, "update_goal_task", {});
+		assert.equal(await countCheckpoints(h), 0, "routine goal hygiene must not reset the cooldown");
+	} finally {
+		// temp dir cleanup is best-effort.
+	}
+});
+
+test("fork patch 1: objective-work turns keep the upstream immediate wake", async () => {
+	const { cwd, goal } = fixtureCwd();
+	const h = createHarness(cwd);
+	try {
+		await startSession(h.handlers, h.ctx, sessionEntriesFor(goal));
+		await userTurn(h);
+
+		await settleTurn(h, "write", { path: "src/x.ts", content: "x" });
+		assert.equal(await countCheckpoints(h), 1, "write/edit/bash turns keep the round-trip continuation cadence");
+	} finally {
+		// temp dir cleanup is best-effort.
+	}
+});
+
+test("fork patch 2: a live background run holds even objective-work turns", async () => {
+	const { cwd, goal } = fixtureCwd();
+	const h = createHarness(cwd);
+	try {
+		await startSession(h.handlers, h.ctx, sessionEntriesFor(goal));
+		await userTurn(h);
+
+		// pi-subagents background spawn (the producer delivers completion back
+		// into this session with triggerTurn: true when it finishes).
+		h.events.emit("subagents:created", { id: "agent-1", type: "general-purpose", description: "audit", isBackground: true });
+		await settleTurn(h, "write", { path: "src/x.ts", content: "x" });
+		assert.equal(await countCheckpoints(h), 0, "the background completion event is the wake, not an unconditional re-queue");
+
+		// Settled: the registry no longer holds the goal, and a later productive
+		// turn resumes the upstream cadence.
+		h.events.emit("subagents:completed", { id: "agent-1", status: "completed" });
+		await userTurn(h);
+		await settleTurn(h, "write", { path: "src/x.ts", content: "y" });
+		assert.equal(await countCheckpoints(h), 1, "after the run settles the immediate cadence returns");
+	} finally {
+		// temp dir cleanup is best-effort.
+	}
+});
+
+test("fork patch 2: workflow lifecycle events hold and release the continuation gate", async () => {
+	const { cwd, goal } = fixtureCwd();
+	const h = createHarness(cwd);
+	try {
+		await startSession(h.handlers, h.ctx, sessionEntriesFor(goal));
+		await userTurn(h);
+
+		h.events.emit("pi-dynamic-workflows:lifecycle", { status: "started", runId: "run-1", name: "audit", sessionId: "test-session" });
+		await settleTurn(h, "write", { path: "src/x.ts", content: "x" });
+		assert.equal(await countCheckpoints(h), 0, "a live workflow run holds the continuation");
+
+		h.events.emit("pi-dynamic-workflows:lifecycle", { status: "completed", runId: "run-1", name: "audit", sessionId: "test-session" });
+		await userTurn(h);
+		await settleTurn(h, "write", { path: "src/x.ts", content: "y" });
+		assert.equal(await countCheckpoints(h), 1, "workflow completion releases the gate");
+	} finally {
+		// temp dir cleanup is best-effort.
+	}
+});
+
+test("fork patch 2: another session's workflow run cannot hold this session", async () => {
+	const { cwd, goal } = fixtureCwd();
+	const h = createHarness(cwd);
+	try {
+		await startSession(h.handlers, h.ctx, sessionEntriesFor(goal));
+		await userTurn(h);
+
+		h.events.emit("pi-dynamic-workflows:lifecycle", { status: "started", runId: "run-2", name: "other", sessionId: "other-session" });
+		await settleTurn(h, "write", { path: "src/x.ts", content: "x" });
+		assert.equal(await countCheckpoints(h), 1, "a foreign session's run is not a wake this session can receive");
 	} finally {
 		// temp dir cleanup is best-effort.
 	}
