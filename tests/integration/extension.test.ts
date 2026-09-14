@@ -448,7 +448,7 @@ describe("five-tool handler integration", () => {
 				await start(h);
 				await h.commands.get("goal-settings").handler("", h.ctx);
 				const lines = firstOptions.filter((o) => o.startsWith("  ") && !o.startsWith("  ───"));
-				assert.equal(lines.length, 16, `all sixteen rows rendered, got: ${lines.join(" | ")}`);
+				assert.equal(lines.length, 17, `all seventeen rows rendered, got: ${lines.join(" | ")}`);
 				assert.ok(lines.some((l) => l === "  auditor disabled: true (project override)"));
 				assert.ok(lines.some((l) => l === "  provider: anthropic (project override)"));
 				assert.ok(lines.some((l) => l === "  model: (default) (default)"));
@@ -460,6 +460,7 @@ describe("five-tool handler integration", () => {
 				assert.ok(lines.some((l) => l === "  hideUnfocusedBanner: false (default)"));
 				assert.ok(lines.some((l) => l === "  stall timeout (minutes): 0 (default)"));
 				assert.ok(lines.some((l) => l === "  max objective length (0 = none): 0 (default)"), "objective length row defaults to 0");
+				assert.ok(lines.some((l) => l === "  continuation idle delay (ms, 0 = legacy): 300000 (default)"), "fork cooldown row defaults to 300s");
 			} finally {
 				f.cleanup();
 			}

@@ -9,6 +9,7 @@ import {
 	DRAFTING_GOAL_TOOLS,
 	FIVE_GOAL_TOOLS,
 	GET_GOAL_TOOL_NAME,
+	GOAL_MUTATION_TOOL_NAMES,
 	GOAL_PROGRESS_TOOL_NAMES,
 	GOAL_WORK_TOOL_NAMES,
 	POST_STOP_ALLOWED_TOOLS,
@@ -20,6 +21,7 @@ import {
 	UPDATE_GOAL_TASK_TOOL_NAME,
 	UPDATE_GOAL_TOOL_NAME,
 } from "../extensions/goal-tool-names.ts";
+import { isMutationProgressToolCall } from "../extensions/goal-format.ts";
 
 const CORE = ["create_goal", "get_goal", "update_goal"];
 
@@ -107,4 +109,31 @@ test("work tool set covers the five goal tools plus common host work tools", () 
 test("POST_STOP_ALLOWED_TOOLS only includes get_goal", () => {
 	assert.equal(POST_STOP_ALLOWED_TOOLS.length, 1, "post-stop allowlist should be minimal");
 	assert.equal(POST_STOP_ALLOWED_TOOLS[0], "get_goal");
+});
+
+// ── Fork patch 1: objective-work vs hygiene classification ──────────────────
+
+test("mutation tool set is the objective-work subset that keeps the upstream cadence", () => {
+	for (const name of ["write", "edit", "bash"]) {
+		assert.ok(GOAL_MUTATION_TOOL_NAMES.includes(name as typeof GOAL_MUTATION_TOOL_NAMES[number]), `mutation set must include ${name}`);
+		assert.ok(GOAL_PROGRESS_TOOL_NAMES.includes(name as typeof GOAL_PROGRESS_TOOL_NAMES[number]), `mutation tool ${name} must stay a progress tool`);
+	}
+	// Read-only host tools AND goal-record bookkeeping are the hygiene class the
+	// fork cooldown targets (audit §A: "routine goal hygiene like update_goal_task").
+	for (const name of [UPDATE_GOAL_TOOL_NAME, SET_GOAL_TASKS_TOOL_NAME, UPDATE_GOAL_TASK_TOOL_NAME, "read", "grep", "find", "ls", GET_GOAL_TOOL_NAME, CREATE_GOAL_TOOL_NAME]) {
+		assert.equal(GOAL_MUTATION_TOOL_NAMES.includes(name as typeof GOAL_MUTATION_TOOL_NAMES[number]), false, `${name} must stay hygiene-class`);
+	}
+});
+
+test("isMutationProgressToolCall separates objective work from hygiene", () => {
+	assert.equal(isMutationProgressToolCall("write", {}), true);
+	assert.equal(isMutationProgressToolCall("edit", {}), true);
+	assert.equal(isMutationProgressToolCall("bash", { command: "git status" }), true, "bash stays productive (unclassifiable syntactically)");
+	assert.equal(isMutationProgressToolCall(UPDATE_GOAL_TASK_TOOL_NAME, {}), false, "goal bookkeeping is hygiene");
+	assert.equal(isMutationProgressToolCall(UPDATE_GOAL_TOOL_NAME, {}), false);
+	assert.equal(isMutationProgressToolCall(SET_GOAL_TASKS_TOOL_NAME, {}), false);
+	assert.equal(isMutationProgressToolCall("read", { path: "src/x.ts" }), false);
+	assert.equal(isMutationProgressToolCall("read", { path: ".pi/goals/active.md" }), false);
+	assert.equal(isMutationProgressToolCall("bash", { command: "echo hi" }), false, "echo-only bash is not even meaningful progress");
+	assert.equal(isMutationProgressToolCall(GET_GOAL_TOOL_NAME, {}), false);
 });

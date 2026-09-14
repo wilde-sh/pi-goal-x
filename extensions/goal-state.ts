@@ -31,7 +31,8 @@ import {
 import { GoalService } from "./goal-service.ts";
 import { goalActivityEvents } from "./goal-ledger.ts";
 import { GoalAccounting } from "./goal-accounting.ts";
-import { GoalRuntime } from "./goal-runtime.ts";
+import { GoalRuntime, type ContinuationQueueOptions } from "./goal-runtime.ts";
+import { createBackgroundWakeRegistry } from "./goal-background-wake.ts";
 import { GoalAuditMessages } from "./goal-session-safety.ts";
 import {
 	focusedGoalFromPool,
@@ -73,6 +74,8 @@ export interface GoalCore {
 	exitGoalModal(): void;
 	auditAborted: boolean;
 	goalWorkToolCalledThisTurn: boolean;
+	/** Fork patch 1: whether this turn called objective-work tooling (write/edit/bash). */
+	goalMutationToolCalledThisTurn: boolean;
 	tasksEnabled: boolean;
 	debugMode: boolean;
 	terminalInputUnsubscribe: (() => void) | null;
@@ -124,7 +127,9 @@ export interface GoalCore {
 	pauseActiveGoal(ctx: ExtensionContext): void;
 	/** §auditor-toggle: flip the focused goal's persisted per-goal skipAuditor and record the ledger event. */
 	toggleGoalAuditor(ctx: ExtensionContext): void;
-	queueContinuation(ctx: ExtensionContext, force?: boolean): void;
+	queueContinuation(ctx: ExtensionContext, force?: boolean, options?: ContinuationQueueOptions): void;
+	/** Fork patch 2: scope the background-wake registry to the active session. */
+	setBackgroundWakeSessionId(sessionId: string | null | undefined): void;
 	flushGoalTransaction(ctx: ExtensionContext): void;
 	replaceGoal(config: GoalCreationConfig, ctx: ExtensionContext, startNow?: boolean, verificationContract?: string, tokenBudget?: number): void;
 	/** F5: bump the last-activity timestamp (called on real work events). */
@@ -261,6 +266,16 @@ export function createGoalCore(
 	// steering reminders live in `runtime` (extensions/goal-runtime.ts);
 	// token/time accounting lives in `accounting` (extensions/goal-accounting.ts).
 	let goalWorkToolCalledThisTurn = false;
+	// Fork patch 1: tracks whether this turn called objective-work tooling
+	// (write/edit/bash). A turn with only read-only or goal-bookkeeping calls is
+	// the no-progress class the continuation cooldown targets.
+	let goalMutationToolCalledThisTurn = false;
+
+	// Fork patch 2: live background workflow/subagent runs reported by producer
+	// extensions over `pi.events`; while one is live the continuation waits for
+	// the run's completion event (idle delay = deadline).
+	const backgroundWake = createBackgroundWakeRegistry();
+	backgroundWake.attach(pi.events);
 
 	const runtime = new GoalRuntime({
 		sendFollowUp: (content, details) => {
@@ -276,6 +291,8 @@ export function createGoalCore(
 		},
 		getGoal: () => state.goal,
 		isActionable: (goalId) => isActionableContinuationGoal(goalId),
+		continuationIdleDelayMs: (ctx) => loadGoalSettings(ctx.cwd).continuationIdleDelayMs,
+		liveBackgroundRuns: () => backgroundWake.liveCount(),
 	});
 	const accounting = new GoalAccounting();
 
@@ -861,9 +878,14 @@ export function createGoalCore(
 		goalService.flushTurn(ctx);
 	}
 
-	function queueContinuation(ctx: ExtensionContext, force = false): void {
+	function queueContinuation(ctx: ExtensionContext, force = false, options?: ContinuationQueueOptions): void {
 		if (!state.goal) return;
-		runtime.queueContinuation(ctx, state.goal, force);
+		runtime.queueContinuation(ctx, state.goal, force, options);
+	}
+
+	/** Fork patch 2: bind the background-wake registry to the active session id. */
+	function setBackgroundWakeSessionId(sessionId: string | null | undefined): void {
+		backgroundWake.setSessionId(sessionId);
 	}
 
 	function enterGoalModal(): void {
@@ -974,6 +996,12 @@ export function createGoalCore(
 		set goalWorkToolCalledThisTurn(value: boolean) {
 			goalWorkToolCalledThisTurn = value;
 		},
+		get goalMutationToolCalledThisTurn() {
+			return goalMutationToolCalledThisTurn;
+		},
+		set goalMutationToolCalledThisTurn(value: boolean) {
+			goalMutationToolCalledThisTurn = value;
+		},
 		get tasksEnabled() {
 			return tasksEnabled;
 		},
@@ -1044,6 +1072,7 @@ export function createGoalCore(
 		pauseActiveGoal,
 		toggleGoalAuditor,
 		queueContinuation,
+		setBackgroundWakeSessionId,
 		flushGoalTransaction,
 		touchGoalActivity,
 		checkStall,

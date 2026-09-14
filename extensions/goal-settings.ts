@@ -28,6 +28,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { KeyId } from "@earendil-works/pi-tui";
+import { DEFAULT_CONTINUATION_IDLE_DELAY_MS } from "./goal-runtime.ts";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -108,6 +109,13 @@ export interface GoalSettingsResolvedShape {
 	 * /goal-tweak).
 	 */
 	objectiveMaxChars?: number;
+	/**
+	 * Fork patch 1: cooldown in ms before a no-progress continuation re-queues
+	 * (and before any continuation while a background run is live).
+	 * 0 = upstream legacy immediate wake.
+	 * Env override: PI_GOAL_CONTINUATION_IDLE_DELAY_MS.
+	 */
+	continuationIdleDelayMs?: number;
 	/** Keyboard shortcuts for the compact task list and dashboard expansion. */
 	keybindings?: GoalKeybindings;
 	/** PR #29: suppress the unfocused goal widget + status hint (default false). */
@@ -329,6 +337,7 @@ const ALLOWED_SETTINGS_KEYS = new Set([
 	"auditorProjectResources",
 	"stallTimeoutMinutes",
 	"objectiveMaxChars",
+	"continuationIdleDelayMs",
 	"keybindings",
 	"hideUnfocusedBanner",
 	"oracle",
@@ -398,7 +407,8 @@ export function parseSettingsLayer(
 				break;
 			}
 			case "stallTimeoutMinutes":
-			case "objectiveMaxChars": {
+			case "objectiveMaxChars":
+			case "continuationIdleDelayMs": {
 				const parsed = asNonNegativeInt(value);
 				if (parsed === undefined) diagnostics.push(diagnostic("invalid_value", `${key} must be an integer >= 0`, key));
 				else layer[key] = parsed;
@@ -673,7 +683,7 @@ function pathKey(...parts: Array<string | undefined>): string {
  * Resolve both layers + env into one snapshot with per-leaf provenance.
  * Nested keybindings resolve leaf-by-leaf from the SPARSE layers.
  */
-const resolutionEnvKeys = ["PI_GOAL_DISABLE_TASKS", "PI_GOAL_DISABLE_CONTRACTS", "PI_GOAL_OBJECTIVE_MAX_CHARS", "PI_GOAL_NETWORK_RECOVERY_MAX_ATTEMPTS", "PI_GOAL_NETWORK_RECOVERY_MAX_DELAY_MS"] as const;
+const resolutionEnvKeys = ["PI_GOAL_DISABLE_TASKS", "PI_GOAL_DISABLE_CONTRACTS", "PI_GOAL_OBJECTIVE_MAX_CHARS", "PI_GOAL_NETWORK_RECOVERY_MAX_ATTEMPTS", "PI_GOAL_NETWORK_RECOVERY_MAX_DELAY_MS", "PI_GOAL_CONTINUATION_IDLE_DELAY_MS"] as const;
 const resolvedSettingsCache: Array<{global: SettingsLayerRead; project: SettingsLayerRead; environment: Array<string | undefined>; snapshot: SettingsSnapshot}> = [];
 
 function resolvedSettingsSnapshot(cwd: string, env: NodeJS.ProcessEnv): SettingsSnapshot {
@@ -793,6 +803,13 @@ function resolvedSettingsSnapshot(cwd: string, env: NodeJS.ProcessEnv): Settings
 		defaultValue: 0,
 		envVar: "PI_GOAL_OBJECTIVE_MAX_CHARS",
 	}));
+	const continuationIdleDelayMs = track("continuationIdleDelayMs", resolveLeaf<number>({
+		envValue: envInt("PI_GOAL_CONTINUATION_IDLE_DELAY_MS"),
+		projectValue: project.layer.continuationIdleDelayMs,
+		globalValue: global.layer.continuationIdleDelayMs,
+		defaultValue: DEFAULT_CONTINUATION_IDLE_DELAY_MS,
+		envVar: "PI_GOAL_CONTINUATION_IDLE_DELAY_MS",
+	}));
 	const networkRecoveryMaxAttempts = track("networkRecovery.maxAttempts", resolveLeaf<number>({
 		envValue: envInt("PI_GOAL_NETWORK_RECOVERY_MAX_ATTEMPTS"),
 		projectValue: project.layer.networkRecovery?.maxAttempts,
@@ -841,6 +858,7 @@ function resolvedSettingsSnapshot(cwd: string, env: NodeJS.ProcessEnv): Settings
 		hideUnfocusedBanner,
 		stallTimeoutMinutes,
 		objectiveMaxChars,
+		continuationIdleDelayMs,
 		keybindings,
 		networkRecovery: {
 			maxAttempts: networkRecoveryMaxAttempts,
@@ -1191,6 +1209,7 @@ function buildPersistedLayer(settings: GoalSettings): Record<string, unknown> {
 	}
 	if (settings.stallTimeoutMinutes !== undefined) persisted.stallTimeoutMinutes = settings.stallTimeoutMinutes;
 	if (settings.objectiveMaxChars !== undefined) persisted.objectiveMaxChars = settings.objectiveMaxChars;
+	if (settings.continuationIdleDelayMs !== undefined) persisted.continuationIdleDelayMs = settings.continuationIdleDelayMs;
 	if (settings.keybindings?.dashboard) {
 		persisted.keybindings = { dashboard: { ...settings.keybindings.dashboard } };
 	}
@@ -1206,6 +1225,7 @@ export function envOverrideFor(key: keyof GoalSettings | "settingsFile", env: No
 	if (key === "disableTasks" && env.PI_GOAL_DISABLE_TASKS !== undefined) return "PI_GOAL_DISABLE_TASKS";
 	if (key === "disableContracts" && env.PI_GOAL_DISABLE_CONTRACTS !== undefined) return "PI_GOAL_DISABLE_CONTRACTS";
 	if (key === "objectiveMaxChars" && env.PI_GOAL_OBJECTIVE_MAX_CHARS !== undefined) return "PI_GOAL_OBJECTIVE_MAX_CHARS";
+	if (key === "continuationIdleDelayMs" && env.PI_GOAL_CONTINUATION_IDLE_DELAY_MS !== undefined) return "PI_GOAL_CONTINUATION_IDLE_DELAY_MS";
 	if (key === "networkRecovery") {
 		if (env.PI_GOAL_NETWORK_RECOVERY_MAX_ATTEMPTS !== undefined) return "PI_GOAL_NETWORK_RECOVERY_MAX_ATTEMPTS";
 		if (env.PI_GOAL_NETWORK_RECOVERY_MAX_DELAY_MS !== undefined) return "PI_GOAL_NETWORK_RECOVERY_MAX_DELAY_MS";
@@ -1234,6 +1254,7 @@ export function effectiveSettingsReport(cwd: string, env: NodeJS.ProcessEnv = pr
 		{ key: "hideUnfocusedBanner", label: "hide unfocused banner", format: () => String(snapshot.value.hideUnfocusedBanner) },
 		{ key: "stallTimeoutMinutes", label: "stall timeout (minutes)", format: () => String(snapshot.value.stallTimeoutMinutes) },
 		{ key: "objectiveMaxChars", label: "max objective length (0 = none)", format: () => String(snapshot.value.objectiveMaxChars) },
+		{ key: "continuationIdleDelayMs", label: "continuation idle delay (ms, 0 = legacy)", format: () => String(snapshot.value.continuationIdleDelayMs) },
 		{ key: "networkRecovery", label: "network recovery attempts (0 = unbounded)", format: () => String(snapshot.value.networkRecovery?.maxAttempts ?? 0) },
 		{ key: "networkRecovery", label: "network recovery max delay (ms)", format: () => String(snapshot.value.networkRecovery?.maxDelayMs ?? DEFAULT_NETWORK_RECOVERY_MAX_DELAY_MS) },
 		{ key: "keybindings", label: "dashboard keybindings", format: () => `${snapshot.value.keybindings!.dashboard.toggleExpand}, ${snapshot.value.keybindings!.dashboard.scrollUp}, ${snapshot.value.keybindings!.dashboard.scrollDown}` },

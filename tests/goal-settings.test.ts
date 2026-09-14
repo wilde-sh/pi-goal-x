@@ -23,6 +23,7 @@ import {
 	formatGoalKeybinding,
 	type GoalSettings,
 } from "../extensions/goal-settings.ts";
+import { DEFAULT_CONTINUATION_IDLE_DELAY_MS } from "../extensions/goal-runtime.ts";
 
 // ── parseGoalSettings ───────────────────────────────────────────────────
 
@@ -282,6 +283,40 @@ test("loadGoalSettings: objectiveMaxChars defaults to no limit and honors the en
 		assert.equal(loadGoalSettings(dir, { PI_GOAL_OBJECTIVE_MAX_CHARS: "8000" }).objectiveMaxChars, 8000, "env var overrides file");
 	});
 	assert.equal(loadGoalSettings("/tmp/does-not-exist", {}).objectiveMaxChars, 0, "unset resolves to the default 0 (no limit)");
+});
+
+// ── continuationIdleDelayMs (fork patch 1 cooldown) ──────────────────────
+
+test("parseGoalSettings: continuationIdleDelayMs accepts 0 and positive integers, rejects invalid", () => {
+	assert.deepEqual(parseGoalSettings({ continuationIdleDelayMs: 0 }), { continuationIdleDelayMs: 0 });
+	assert.deepEqual(parseGoalSettings({ continuationIdleDelayMs: 300_000 }), { continuationIdleDelayMs: 300_000 });
+	assert.deepEqual(parseGoalSettings({ continuationIdleDelayMs: "60000" }), { continuationIdleDelayMs: 60_000 });
+	assert.deepEqual(parseGoalSettings({ continuationIdleDelayMs: -1 }), {}, "negative rejected");
+	assert.deepEqual(parseGoalSettings({ continuationIdleDelayMs: 1.5 }), {}, "non-integer rejected");
+});
+
+test("loadGoalSettings: continuationIdleDelayMs defaults to the fork cooldown and honors file + env", () => {
+	withTempDir((dir) => {
+		const configPath = goalSettingsPath(dir);
+		fs.mkdirSync(path.dirname(configPath), { recursive: true });
+		fs.writeFileSync(configPath, JSON.stringify({ continuationIdleDelayMs: 120_000 }), "utf8");
+		assert.equal(loadGoalSettings(dir, {}).continuationIdleDelayMs, 120_000, "file config read");
+		assert.equal(
+			loadGoalSettings(dir, { PI_GOAL_CONTINUATION_IDLE_DELAY_MS: "0" }).continuationIdleDelayMs,
+			0,
+			"env 0 restores the legacy immediate wake",
+		);
+		assert.equal(
+			loadGoalSettings(dir, { PI_GOAL_CONTINUATION_IDLE_DELAY_MS: "1500" }).continuationIdleDelayMs,
+			1500,
+			"env overrides the file layer",
+		);
+	});
+	assert.equal(
+		loadGoalSettings("/tmp/does-not-exist", {}).continuationIdleDelayMs,
+		DEFAULT_CONTINUATION_IDLE_DELAY_MS,
+		"unset resolves to the fork default (300s)",
+	);
 });
 
 // ── networkRecovery (provider-error recovery backoff) ─────────────────

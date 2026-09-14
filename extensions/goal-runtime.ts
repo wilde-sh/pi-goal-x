@@ -16,6 +16,35 @@ import { networkErrorBackoffPlan, type NetworkErrorBackoffPlan, type NetworkErro
 
 export const CONTINUATION_IDLE_RETRY_MS = 50;
 
+/**
+ * Fork patch 1 default: cooldown before a no-progress continuation re-queues.
+ * A turn whose progress calls were all hygiene (read-only host tools or
+ * goal-record bookkeeping) waits this long instead of waking immediately; a
+ * turn that did objective work (write/edit/bash) keeps the upstream cadence,
+ * and any turn while a background run is live (patch 2) also waits it out.
+ * `PI_GOAL_CONTINUATION_IDLE_DELAY_MS=0` restores upstream legacy behavior.
+ */
+export const DEFAULT_CONTINUATION_IDLE_DELAY_MS = 300_000;
+
+/** Progress class of the turn that just ended (fork patches 1 + 2). */
+export type ContinuationTurnKind = "productive" | "hygiene";
+
+export interface ContinuationQueueOptions {
+	/**
+	 * The turn that just ended called only read-only/goal-hygiene tools
+	 * ("hygiene") or did objective work ("productive"). Omitted for
+	 * user-initiated resumes/compaction, which keep the immediate upstream
+	 * behavior.
+	 */
+	turnKind?: ContinuationTurnKind;
+	/**
+	 * Fork patch 2: this re-queue came from a completed turn, so hold it while
+	 * a background workflow/subagent run is live — the run's completion event
+	 * is the wake, and the idle delay is the deadline.
+	 */
+	backgroundWait?: boolean;
+}
+
 const POST_STOP_ALLOWED = new Set<string>(POST_STOP_ALLOWED_TOOLS);
 
 export interface GoalRuntimeHooks {
@@ -25,6 +54,10 @@ export interface GoalRuntimeHooks {
 	getGoal(): GoalRecord | null;
 	/** Whether a checkpointed goal id is still actionable (active + autoContinue). */
 	isActionable(goalId: string | null | undefined): boolean;
+	/** Fork patch 1: resolved continuation cooldown in ms (0 = upstream legacy). */
+	continuationIdleDelayMs?: (ctx: ExtensionContext) => number | undefined;
+	/** Fork patch 2: live background workflow/subagent runs, if a registry is attached. */
+	liveBackgroundRuns?: () => number;
 }
 
 export class GoalRuntime {
@@ -82,8 +115,15 @@ export class GoalRuntime {
 	 * Schedule the next auto-continuation for the focused active goal.
 	 * Only `active` + autoContinue goals can queue. `force` bypasses the
 	 * already-queued/scheduled dedup (used right after creation/resume).
+	 *
+	 * Fork patches 1 + 2: when `options.turnKind`/`options.backgroundWait` are
+	 * provided, hygiene-only turns and any turn while a background run is live
+	 * wait out the configured "continuationIdleDelayMs" cooldown instead of
+	 * waking immediately; the idle delay doubles as the deadline when a
+	 * background completion event is the expected wake. `force` still bypasses
+	 * only the dedup, never the cooldown classification.
 	 */
-	queueContinuation(ctx: ExtensionContext, goal: GoalRecord, force = false): void {
+	queueContinuation(ctx: ExtensionContext, goal: GoalRecord, force = false, options: ContinuationQueueOptions = {}): void {
 		if (goal.status !== "active" || !goal.autoContinue) return;
 		const goalId = goal.id;
 		if (!force && this.continuationPendingFor(goalId)) return;
@@ -93,6 +133,15 @@ export class GoalRuntime {
 			delay = ctx.isIdle() && !ctx.hasPendingMessages() ? 0 : CONTINUATION_IDLE_RETRY_MS;
 		} catch {
 			return;
+		}
+		if (options.turnKind !== undefined || options.backgroundWait === true) {
+			const backgroundLive = options.backgroundWait ? (this.hooks.liveBackgroundRuns?.() ?? 0) : 0;
+			if (options.turnKind === "hygiene" || backgroundLive > 0) {
+				const cooldown = this.hooks.continuationIdleDelayMs?.(ctx) ?? DEFAULT_CONTINUATION_IDLE_DELAY_MS;
+				// 0 is the explicit upstream-legacy override; a busy context keeps
+				// its short idle-poll retry instead.
+				if (cooldown > 0) delay = cooldown;
+			}
 		}
 		this.continuationScheduledFor = goalId;
 		this.continuationTimer = setTimeout(() => this.sendQueuedContinuation(ctx, goalId), delay);
